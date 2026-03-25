@@ -266,8 +266,9 @@ class PDADiscovery:
                     "signer": ix_accounts[0],
                     "player_entity": ix_accounts[1],
                     "player_component": ix_accounts[2],
-                    "player_data": ix_accounts[3],
-                    "pool_state": ix_accounts[4],
+                    "pool_state": ix_accounts[3],
+                    "player_data": ix_accounts[4],
+                    "user_state": ix_accounts[5],
                 }
                 log.info("找到 PDA:")
                 for name, addr in pdas.items():
