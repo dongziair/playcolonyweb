@@ -5,10 +5,7 @@ PlayColony 链上自动套利脚本
 
 使用步骤：
 1. pip install solana solders
-2. 设置环境变量：
-   set COLONY_PRIVATE_KEY=你的私钥(base58格式)
-   或将私钥 json 文件路径设置为:
-   set COLONY_KEYPAIR_PATH=C:/path/to/keypair.json
+2. 编辑 .env 文件，填入你的 base58 私钥
 3. python colony_onchain.py discover   # 自动发现用户 PDA 地址
 4. python colony_onchain.py rates      # 查看当前汇率
 5. python colony_onchain.py monitor    # 持续监控（dry-run）
@@ -60,8 +57,10 @@ MIN_PROFIT = 0.003
 CHECK_INTERVAL = 5
 MAX_TRADES_PER_HOUR = 30
 
-# 用户 PDA 文件
-PDA_FILE = Path(__file__).parent / "user_pdas.json"
+# 文件路径
+BASE_DIR = Path(__file__).parent
+ENV_FILE = BASE_DIR / ".env"
+PDA_FILE = BASE_DIR / "user_pdas.json"
 LOG_FILE = Path(__file__).parent / "onchain_log.txt"
 
 logging.basicConfig(
@@ -76,25 +75,39 @@ log = logging.getLogger("colony_onchain")
 
 
 # ============================================================
-# 密钥加载
+# .env 加载 + 密钥加载
 # ============================================================
 
+def load_env():
+    """从 .env 文件加载配置到环境变量"""
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, val = line.split("=", 1)
+                key, val = key.strip(), val.strip()
+                if val and val != "在这里填入你的base58私钥":
+                    os.environ.setdefault(key, val)
+
+
 def load_keypair() -> Keypair:
-    """从环境变量加载钱包密钥"""
-    # 方式1: base58 私钥
+    """从 .env 文件或环境变量加载钱包密钥"""
+    load_env()
+
     pk = os.environ.get("COLONY_PRIVATE_KEY")
     if pk:
         return Keypair.from_base58_string(pk)
 
-    # 方式2: JSON 文件路径 (Solana CLI 格式: [u8; 64])
     path = os.environ.get("COLONY_KEYPAIR_PATH")
     if path and Path(path).exists():
         data = json.loads(Path(path).read_text())
         return Keypair.from_bytes(bytes(data))
 
-    print("请设置环境变量:")
-    print("  set COLONY_PRIVATE_KEY=<base58私钥>")
-    print("  或 set COLONY_KEYPAIR_PATH=<keypair.json路径>")
+    print("请在 .env 文件中填入私钥:")
+    print(f"  文件路径: {ENV_FILE}")
+    print("  格式: COLONY_PRIVATE_KEY=你的base58私钥")
     sys.exit(1)
 
 
@@ -156,62 +169,63 @@ class PoolReader:
 class PDADiscovery:
     """从用户历史交易中发现 PDA 地址"""
 
+    B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
     def __init__(self, rpc: Client, user: Pubkey):
         self.rpc = rpc
         self.user = user
 
+    @staticmethod
+    def b58decode(s: str) -> bytes:
+        n = 0
+        for c in s:
+            n = n * 58 + PDADiscovery.B58_ALPHABET.index(c)
+        if n == 0:
+            return b"\x00"
+        return n.to_bytes((n.bit_length() + 7) // 8, "big")
+
     def discover(self) -> dict:
-        """扫描用户与 RESOURCE_PROGRAM 的交互历史，提取 PDA"""
-        log.info(f"扫描用户 {self.user} 的交易历史...")
+        """多种策略搜索用户 PDA"""
+        log.info(f"钱包地址: {self.user}")
 
-        # 方法: 从 pool 账户的交易中过滤出当前用户的 swap 交易
-        sigs = self.rpc.get_signatures_for_address(POOL_STATE, limit=50)
+        # 策略1: 从 pool 账户的交易中筛选
+        pdas = self._search_pool_txs()
+        if pdas:
+            return pdas
 
-        alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+        # 策略2: 从用户钱包的所有交易中搜索
+        pdas = self._search_user_txs()
+        if pdas:
+            return pdas
 
-        def b58decode(s):
-            n = 0
-            for c in s:
-                n = n * 58 + alphabet.index(c)
-            if n == 0:
-                return b"\x00"
-            return n.to_bytes((n.bit_length() + 7) // 8, "big")
+        log.warning("未找到 swap 交易记录")
+        log.warning("请先在游戏中手动执行一次 swap，然后重新运行 discover")
+        return {}
+
+    def _search_pool_txs(self) -> Optional[dict]:
+        """从 pool 账户的交易中筛选当前用户的 swap"""
+        log.info("搜索 pool 账户交易记录...")
+        sigs = self.rpc.get_signatures_for_address(POOL_STATE, limit=200)
+        user_str = str(self.user)
 
         for sig_info in sigs.value:
-            tx = self.rpc.get_transaction(
-                sig_info.signature, max_supported_transaction_version=0
-            )
-            if not tx.value:
-                continue
+            pdas = self._check_tx(sig_info.signature, user_str)
+            if pdas:
+                return pdas
+        return None
 
-            msg = tx.value.transaction.transaction.message
-            acct_keys = [str(k) for k in msg.account_keys]
+    def _search_user_txs(self) -> Optional[dict]:
+        """从用户钱包的所有交易中搜索"""
+        log.info("搜索用户钱包交易记录...")
+        sigs = self.rpc.get_signatures_for_address(self.user, limit=200)
+        user_str = str(self.user)
 
-            # 检查是否是当前用户的交易
-            if str(self.user) not in acct_keys:
-                continue
+        for sig_info in sigs.value:
+            pdas = self._check_tx(sig_info.signature, user_str)
+            if pdas:
+                return pdas
 
-            for ix in msg.instructions:
-                raw = b58decode(ix.data)
-                if raw[:8] == SWAP_DISCRIMINATOR:
-                    # 找到 swap 交易! 提取账户布局
-                    ix_accounts = [acct_keys[idx] for idx in ix.accounts]
-                    pdas = {
-                        "signer": ix_accounts[0],
-                        "player_entity": ix_accounts[1],
-                        "player_component": ix_accounts[2],
-                        "player_data": ix_accounts[3],
-                        "pool_state": ix_accounts[4],
-                    }
-                    log.info("找到用户 PDA:")
-                    for name, addr in pdas.items():
-                        log.info(f"  {name}: {addr}")
-                    return pdas
-
-        # 如果没找到 swap 交易，从用户钱包的所有交易中搜索
-        log.info("从用户钱包交易中搜索...")
-        user_sigs = self.rpc.get_signatures_for_address(self.user, limit=50)
-        for sig_info in user_sigs.value:
+            # 也检查非 swap 但与 ResourceProgram 交互的交易
             tx = self.rpc.get_transaction(
                 sig_info.signature, max_supported_transaction_version=0
             )
@@ -219,18 +233,46 @@ class PDADiscovery:
                 continue
             msg = tx.value.transaction.transaction.message
             acct_keys = [str(k) for k in msg.account_keys]
-
             for ix in msg.instructions:
                 prog = acct_keys[ix.program_id_index]
                 if prog == str(RESOURCE_PROGRAM):
-                    raw = b58decode(ix.data)
+                    raw = self.b58decode(ix.data)
                     ix_accounts = [acct_keys[idx] for idx in ix.accounts]
-                    log.info(f"找到与 ResourceProgram 交互: disc={raw[:8].hex()}")
+                    log.info(f"发现 ResourceProgram 交互: disc={raw[:8].hex()}")
                     log.info(f"  accounts: {ix_accounts}")
 
-        log.warning("未找到该用户的 swap 交易记录")
-        log.warning("请先在游戏中手动执行一次 swap 交易，然后重新运行 discover")
-        return {}
+        return None
+
+    def _check_tx(self, signature, user_str: str) -> Optional[dict]:
+        """检查单笔交易中是否包含 swap 指令"""
+        tx = self.rpc.get_transaction(
+            signature, max_supported_transaction_version=0
+        )
+        if not tx.value:
+            return None
+
+        msg = tx.value.transaction.transaction.message
+        acct_keys = [str(k) for k in msg.account_keys]
+
+        if user_str not in acct_keys:
+            return None
+
+        for ix in msg.instructions:
+            raw = self.b58decode(ix.data)
+            if raw[:8] == SWAP_DISCRIMINATOR:
+                ix_accounts = [acct_keys[idx] for idx in ix.accounts]
+                pdas = {
+                    "signer": ix_accounts[0],
+                    "player_entity": ix_accounts[1],
+                    "player_component": ix_accounts[2],
+                    "player_data": ix_accounts[3],
+                    "pool_state": ix_accounts[4],
+                }
+                log.info("找到 PDA:")
+                for name, addr in pdas.items():
+                    log.info(f"  {name}: {addr}")
+                return pdas
+        return None
 
 
 # ============================================================
