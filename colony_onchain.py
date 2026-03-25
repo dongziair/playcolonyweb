@@ -75,6 +75,18 @@ logging.basicConfig(
 log = logging.getLogger("colony_onchain")
 
 
+B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58decode(s: str) -> bytes:
+    n = 0
+    for c in s:
+        n = n * 58 + B58_ALPHABET.index(c)
+    if n == 0:
+        return b"\x00"
+    return n.to_bytes((n.bit_length() + 7) // 8, "big")
+
+
 # ============================================================
 # .env 加载 + 密钥加载
 # ============================================================
@@ -99,7 +111,11 @@ def load_keypair() -> Keypair:
 
     pk = os.environ.get("COLONY_PRIVATE_KEY")
     if pk:
-        return Keypair.from_base58_string(pk)
+        try:
+            return Keypair.from_base58_string(pk)
+        except ValueError:
+            raw = b58decode(pk)
+            return Keypair.from_bytes(raw[:64])
 
     path = os.environ.get("COLONY_KEYPAIR_PATH")
     if path and Path(path).exists():
@@ -170,20 +186,9 @@ class PoolReader:
 class PDADiscovery:
     """从用户历史交易中发现 PDA 地址"""
 
-    B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
     def __init__(self, rpc: Client, user: Pubkey):
         self.rpc = rpc
         self.user = user
-
-    @staticmethod
-    def b58decode(s: str) -> bytes:
-        n = 0
-        for c in s:
-            n = n * 58 + PDADiscovery.B58_ALPHABET.index(c)
-        if n == 0:
-            return b"\x00"
-        return n.to_bytes((n.bit_length() + 7) // 8, "big")
 
     def discover(self) -> dict:
         """多种策略搜索用户 PDA"""
@@ -237,7 +242,7 @@ class PDADiscovery:
             for ix in msg.instructions:
                 prog = acct_keys[ix.program_id_index]
                 if prog == str(RESOURCE_PROGRAM):
-                    raw = self.b58decode(ix.data)
+                    raw = b58decode(ix.data)
                     ix_accounts = [acct_keys[idx] for idx in ix.accounts]
                     log.info(f"发现 ResourceProgram 交互: disc={raw[:8].hex()}")
                     log.info(f"  accounts: {ix_accounts}")
@@ -259,7 +264,7 @@ class PDADiscovery:
             return None
 
         for ix in msg.instructions:
-            raw = self.b58decode(ix.data)
+            raw = b58decode(ix.data)
             if raw[:8] == SWAP_DISCRIMINATOR:
                 ix_accounts = [acct_keys[idx] for idx in ix.accounts]
                 pdas = {
