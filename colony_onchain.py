@@ -55,20 +55,11 @@ CHECK_INTERVAL_MIN = 1
 CHECK_INTERVAL_MAX = 2
 SWAP_AMOUNT = 1000
 TRADE_RATIO = 0.30
-REBALANCE_TRADE_RATIO = 0.20
+HIGH_EDGE_TRADE_RATIO = 0.50
 MIN_TRADE_AMOUNT = 100
 MAX_BALANCE_PROBE = 5_000_000
-TARGET_RESOURCE_WEIGHTS = {
-    "Metal": 1 / 3,
-    "Gas": 1 / 3,
-    "Crystal": 1 / 3,
-}
-MAX_RESOURCE_WEIGHT = 0.55
-LOW_RESOURCE_WEIGHT = 0.05
-LOW_RESOURCE_BUY_BONUS = 0.0005
-LOW_RESOURCE_SELL_PENALTY = 0.020
-LOW_RESOURCE_MIN_PROFIT = -0.001
 MAX_CANDIDATES_TO_PROBE = 3
+HIGH_EDGE_PROFIT_THRESHOLD = 0.02
 
 # 文件路径
 BASE_DIR = Path(__file__).parent
@@ -306,7 +297,7 @@ class PlanetStateReader:
 
 
 class InventoryManager:
-    """以资源总和为主目标，仓位只做轻量修正。"""
+    """只负责汇总当前三种资源总量。"""
 
     UTILITY_RESOURCES = ("Metal", "Gas", "Crystal")
 
@@ -318,51 +309,25 @@ class InventoryManager:
         else:
             weights = {name: utility[name] / total for name in self.UTILITY_RESOURCES}
 
-        deviations = {
-            name: weights[name] - TARGET_RESOURCE_WEIGHTS[name]
-            for name in self.UTILITY_RESOURCES
-        }
         return {
             "balances": utility,
             "total": total,
             "weights": weights,
-            "deviations": deviations,
         }
 
     def evaluate_trade(self, sell: str, buy: str, profit: float, summary: dict) -> Optional[dict]:
-        sell_weight = summary["weights"].get(sell, 0.0)
-        buy_weight = summary["weights"].get(buy, 0.0)
-        buy_is_low = buy_weight <= LOW_RESOURCE_WEIGHT
-        sell_is_low = sell_weight <= LOW_RESOURCE_WEIGHT
-        low_resource_replenish = buy_is_low and sell_weight > buy_weight
-
-        blocked = buy_weight >= MAX_RESOURCE_WEIGHT and not buy_is_low
-        if blocked:
-            return None
-
-        priority_bonus = LOW_RESOURCE_BUY_BONUS if low_resource_replenish else 0.0
-        if sell_is_low:
-            priority_bonus -= LOW_RESOURCE_SELL_PENALTY
-
-        if low_resource_replenish:
-            min_profit = LOW_RESOURCE_MIN_PROFIT
-            ratio = REBALANCE_TRADE_RATIO
-        else:
-            min_profit = MIN_PROFIT
-            ratio = TRADE_RATIO
-
-        if profit <= min_profit:
+        if profit <= HIGH_EDGE_PROFIT_THRESHOLD:
             return None
 
         return {
             "profit": profit,
-            "priority_bonus": priority_bonus,
-            "rebalancing": low_resource_replenish,
+            "priority_bonus": 0.0,
+            "rebalancing": False,
             "forced": False,
-            "replenish": low_resource_replenish,
-            "sell_weight": sell_weight,
-            "buy_weight": buy_weight,
-            "ratio": ratio,
+            "replenish": False,
+            "sell_weight": summary["weights"].get(sell, 0.0),
+            "buy_weight": summary["weights"].get(buy, 0.0),
+            "ratio": HIGH_EDGE_TRADE_RATIO,
             "sell_balance": summary["balances"].get(sell, 0),
         }
 
@@ -698,8 +663,11 @@ class Bot:
         log.info(f"钱包: {self.keypair.pubkey()}")
         log.info(
             f"阈值: >{FEE*100:.1f}%手续费 | 间隔: {CHECK_INTERVAL_MIN}-{CHECK_INTERVAL_MAX}s | "
-            f"下单比例: {TRADE_RATIO*100:.0f}%/{REBALANCE_TRADE_RATIO*100:.0f}% | "
+            f"下单比例: {HIGH_EDGE_TRADE_RATIO*100:.0f}% | "
             f"最小下单: {MIN_TRADE_AMOUNT} | 候选探测数: {MAX_CANDIDATES_TO_PROBE}"
+        )
+        log.info(
+            f"触发条件: 总和收益率 > {HIGH_EDGE_PROFIT_THRESHOLD*100:.1f}%，并选择预计收益额最高的一组"
         )
         log.info("Ctrl+C 停止\n")
 
@@ -734,7 +702,7 @@ class Bot:
         )
         log.info(f"  仓位: {weight_str}")
 
-        # 收集所有以总和收益为主、仓位为辅的交易机会
+        # 只做总和收益率大于阈值的方向
         fee_mul = 1 - FEE
         opportunities = []
         for pair, rate in rates.items():
@@ -753,11 +721,22 @@ class Bot:
                 opportunities.append((profit * 100, res_b, res_a, decision))
 
         if not opportunities:
-            log.info("  当前没有兼顾利润和仓位平衡的可执行机会")
+            log.info("  当前没有总和收益率超过阈值的方向")
+            return
+
+        high_edge_candidates = [
+            (raw_profit, sell, buy, decision)
+            for raw_profit, sell, buy, decision in opportunities
+            if (raw_profit / 100) > HIGH_EDGE_PROFIT_THRESHOLD
+        ]
+        if not high_edge_candidates:
+            log.info("  跳过本轮，没有方向的总和收益率超过 2.0%")
             return
 
         rough_ranked = []
-        for raw_profit, sell, buy, decision in opportunities:
+        for raw_profit, sell, buy, decision in high_edge_candidates:
+            decision = dict(decision)
+            decision["ratio"] = HIGH_EDGE_TRADE_RATIO
             rough_available = max(0, decision["sell_balance"])
             rough_amount = min(
                 rough_available,
@@ -767,7 +746,7 @@ class Bot:
             rough_ranked.append((rough_edge, decision["priority_bonus"], raw_profit, sell, buy, decision))
 
         rough_ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        rough_ranked = rough_ranked[:MAX_CANDIDATES_TO_PROBE]
+        rough_ranked = rough_ranked[:max(1, MAX_CANDIDATES_TO_PROBE)]
 
         scored_opportunities = []
         for _, _, raw_profit, sell, buy, decision in rough_ranked:
@@ -812,21 +791,15 @@ class Bot:
         executable = [item for item in scored_opportunities if item["liquid"]]
         if not executable:
             for item in scored_opportunities:
-                if item["decision"]["replenish"]:
-                    tag = "补仓"
-                elif item["decision"]["rebalancing"]:
-                    tag = "再平衡"
-                else:
-                    tag = "套利"
-                log.info(f"  {item['sell']}→{item['buy']} {tag}方向当前不可执行")
+                log.info(f"  {item['sell']}→{item['buy']} 方向当前不可执行")
                 if "InsufficientPoolLiquidity" in item["reason"]:
                     log.info("  原因: 池子在这个方向上接不住最小交易量")
                 else:
                     log.info(f"  原因: {item['reason']}")
-            log.info("  当前没有兼顾总和收益、轻量补仓和成交量的可执行机会")
+            log.info("  当前没有满足收益阈值且可成交的方向")
             return
 
-        # 按预计总和收益额优先，补仓偏好只作为次级排序
+        # 按预计总和收益额优先
         executable.sort(
             key=lambda item: (item["expected_edge"], item["decision"]["priority_bonus"]),
             reverse=True,
@@ -840,15 +813,9 @@ class Bot:
             raw_profit = item["raw_profit"]
             amount = item["amount"]
             available = item["available"]
-            if decision["replenish"]:
-                tag = "补仓"
-            elif decision["rebalancing"]:
-                tag = "再平衡"
-            else:
-                tag = "套利"
             log.info(
                 f"  ★ {sell}→{buy} 总和收益率 {raw_profit:.2f}% | "
-                f"预计收益额 {item['expected_edge']:.1f} | {tag}"
+                f"预计收益额 {item['expected_edge']:.1f}"
             )
 
             if available >= MAX_BALANCE_PROBE:
