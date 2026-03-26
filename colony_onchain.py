@@ -51,10 +51,10 @@ RESOURCE_BALANCE_NAMES = ["Metal", "Gas", "Crystal", "Stardust"]
 # 交易参数
 FEE = 0.003
 MIN_PROFIT = 0.0
-CHECK_INTERVAL_MIN = 3
-CHECK_INTERVAL_MAX = 5
+CHECK_INTERVAL_MIN = 1
+CHECK_INTERVAL_MAX = 2
 SWAP_AMOUNT = 1000
-TRADE_RATIO = 0.15
+TRADE_RATIO = 0.30
 REBALANCE_TRADE_RATIO = 0.25
 FORCED_REBALANCE_TRADE_RATIO = 0.35
 MIN_TRADE_AMOUNT = 100
@@ -70,6 +70,11 @@ BUY_OVERWEIGHT_PENALTY = 0.015
 REBALANCE_MIN_PROFIT = 0.001
 FORCED_CRYSTAL_WEIGHT = 0.80
 FORCED_REBALANCE_MIN_PROFIT = -0.003
+LOW_RESOURCE_WEIGHT = 0.05
+LOW_RESOURCE_BUY_BONUS = 0.008
+LOW_RESOURCE_SELL_PENALTY = 0.020
+LOW_RESOURCE_MIN_PROFIT = -0.001
+MAX_CANDIDATES_TO_PROBE = 3
 
 # 文件路径
 BASE_DIR = Path(__file__).parent
@@ -336,11 +341,14 @@ class InventoryManager:
         sell_dev = summary["deviations"].get(sell, 0.0)
         buy_dev = summary["deviations"].get(buy, 0.0)
         crystal_weight = summary["weights"].get("Crystal", 0.0)
+        buy_is_low = buy_weight <= LOW_RESOURCE_WEIGHT
+        sell_is_low = sell_weight <= LOW_RESOURCE_WEIGHT
         force_crystal_rebalance = (
             crystal_weight >= FORCED_CRYSTAL_WEIGHT
             and sell == "Crystal"
             and buy in ("Metal", "Gas")
         )
+        low_resource_replenish = buy_is_low and sell_weight > buy_weight
 
         blocked = buy_weight >= MAX_RESOURCE_WEIGHT and buy_dev > 0
         if blocked:
@@ -350,12 +358,19 @@ class InventoryManager:
         penalty = max(buy_dev, 0.0) * BUY_OVERWEIGHT_PENALTY
         if force_crystal_rebalance:
             bonus += 0.020
+        if low_resource_replenish:
+            bonus += LOW_RESOURCE_BUY_BONUS
+        if sell_is_low and not force_crystal_rebalance:
+            penalty += LOW_RESOURCE_SELL_PENALTY
         adjusted_profit = profit + bonus - penalty
         rebalancing = sell_dev > 0 and buy_dev < 0
         forced = force_crystal_rebalance
         if forced:
             min_profit = FORCED_REBALANCE_MIN_PROFIT
             ratio = FORCED_REBALANCE_TRADE_RATIO
+        elif low_resource_replenish:
+            min_profit = LOW_RESOURCE_MIN_PROFIT
+            ratio = REBALANCE_TRADE_RATIO
         elif rebalancing:
             min_profit = REBALANCE_MIN_PROFIT
             ratio = REBALANCE_TRADE_RATIO
@@ -371,6 +386,7 @@ class InventoryManager:
             "adjusted_profit": adjusted_profit,
             "rebalancing": rebalancing,
             "forced": forced,
+            "replenish": low_resource_replenish,
             "sell_weight": sell_weight,
             "buy_weight": buy_weight,
             "ratio": ratio,
@@ -710,7 +726,7 @@ class Bot:
         log.info(
             f"阈值: >{FEE*100:.1f}%手续费 | 间隔: {CHECK_INTERVAL_MIN}-{CHECK_INTERVAL_MAX}s | "
             f"下单比例: {TRADE_RATIO*100:.0f}%/{REBALANCE_TRADE_RATIO*100:.0f}%/{FORCED_REBALANCE_TRADE_RATIO*100:.0f}% | "
-            f"最小下单: {MIN_TRADE_AMOUNT}"
+            f"最小下单: {MIN_TRADE_AMOUNT} | 候选探测数: {MAX_CANDIDATES_TO_PROBE}"
         )
         log.info("Ctrl+C 停止\n")
 
@@ -766,8 +782,21 @@ class Bot:
             log.info("  当前没有兼顾利润和仓位平衡的可执行机会")
             return
 
-        scored_opportunities = []
+        rough_ranked = []
         for raw_profit, sell, buy, decision in opportunities:
+            rough_available = max(0, decision["sell_balance"])
+            rough_amount = min(
+                rough_available,
+                max(MIN_TRADE_AMOUNT, int(rough_available * decision["ratio"])) if rough_available else 0,
+            )
+            rough_edge = rough_amount * decision["adjusted_profit"]
+            rough_ranked.append((rough_edge, decision["adjusted_profit"], raw_profit, sell, buy, decision))
+
+        rough_ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        rough_ranked = rough_ranked[:MAX_CANDIDATES_TO_PROBE]
+
+        scored_opportunities = []
+        for _, _, raw_profit, sell, buy, decision in rough_ranked:
             min_probe, min_probe_detail = self.executor.can_trade_amount(sell, buy, MIN_TRADE_AMOUNT)
             if not min_probe:
                 scored_opportunities.append({
@@ -840,6 +869,8 @@ class Bot:
             adjusted_profit = decision["adjusted_profit"]
             if decision["forced"]:
                 tag = "强制再平衡"
+            elif decision["replenish"]:
+                tag = "补仓"
             elif decision["rebalancing"]:
                 tag = "再平衡"
             else:
