@@ -46,13 +46,30 @@ METAL = 0
 GAS = 1
 CRYSTAL = 2
 RESOURCE_NAMES = {0: "Metal", 1: "Gas", 2: "Crystal"}
+RESOURCE_BALANCE_NAMES = ["Metal", "Gas", "Crystal", "Stardust"]
 
 # 交易参数
 FEE = 0.003
 MIN_PROFIT = 0.0
-CHECK_INTERVAL_MIN = 5
-CHECK_INTERVAL_MAX = 10
-SWAP_AMOUNT = 10000
+CHECK_INTERVAL_MIN = 3
+CHECK_INTERVAL_MAX = 5
+SWAP_AMOUNT = 1000
+TRADE_RATIO = 0.15
+REBALANCE_TRADE_RATIO = 0.25
+FORCED_REBALANCE_TRADE_RATIO = 0.35
+MIN_TRADE_AMOUNT = 100
+MAX_BALANCE_PROBE = 5_000_000
+TARGET_RESOURCE_WEIGHTS = {
+    "Metal": 1 / 3,
+    "Gas": 1 / 3,
+    "Crystal": 1 / 3,
+}
+MAX_RESOURCE_WEIGHT = 0.55
+SELL_OVERWEIGHT_BONUS = 0.010
+BUY_OVERWEIGHT_PENALTY = 0.015
+REBALANCE_MIN_PROFIT = 0.001
+FORCED_CRYSTAL_WEIGHT = 0.80
+FORCED_REBALANCE_MIN_PROFIT = -0.003
 
 # 文件路径
 BASE_DIR = Path(__file__).parent
@@ -69,6 +86,7 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("colony_onchain")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -103,14 +121,39 @@ def load_keypair() -> Keypair:
     load_env()
     pk = os.environ.get("COLONY_PRIVATE_KEY")
     if pk:
+        pk = pk.strip()
+        # 策略1: 标准 base58 keypair
         try:
-            return Keypair.from_base58_string(pk)
-        except ValueError:
-            raw = b58decode(pk)
-            log.info(f"key 字符数: {len(pk)}, 解码字节数: {len(raw)}")
-            if len(raw) >= 64:
-                return Keypair.from_bytes(raw[:64])
-            return Keypair.from_bytes(raw)
+            kp = Keypair.from_base58_string(pk)
+            log.info(f"密钥加载成功，公钥: {kp.pubkey()}")
+            return kp
+        except ValueError as e:
+            log.info(f"标准加载失败({e})，尝试其他方式...")
+
+        raw = b58decode(pk)
+        log.info(f"key 字符数: {len(pk)}, 解码字节数: {len(raw)}")
+
+        # 策略2~4: 尝试不同的字节切分方式
+        attempts = []
+        if len(raw) >= 64:
+            attempts.append(("前64字节", raw[:64]))
+            attempts.append(("后64字节", raw[-64:]))
+        if len(raw) >= 32:
+            attempts.append(("前32字节作为seed", raw[:32]))
+
+        for desc, data in attempts:
+            try:
+                if len(data) == 32:
+                    kp = Keypair.from_seed(data)
+                else:
+                    kp = Keypair.from_bytes(data)
+                log.info(f"密钥加载成功（{desc}），公钥: {kp.pubkey()}")
+                return kp
+            except Exception:
+                continue
+
+        log.error(f"所有密钥加载方式均失败，原始字节数: {len(raw)}")
+        sys.exit(1)
 
     path = os.environ.get("COLONY_KEYPAIR_PATH")
     if path and Path(path).exists():
@@ -121,6 +164,25 @@ def load_keypair() -> Keypair:
     print(f"  文件路径: {ENV_FILE}")
     print("  格式: COLONY_PRIVATE_KEY=你的base58私钥")
     sys.exit(1)
+
+
+def normalize_pdas(pdas: dict) -> dict:
+    """兼容旧 discover 输出，并补齐语义化账户名。"""
+    aliases = {
+        "owner": "signer",
+        "planet_state": "player_entity",
+        "planet_nft": "player_component",
+        "trading_pools": "pool_state",
+        "season": "player_data",
+        "session_token": "user_state",
+    }
+    normalized = dict(pdas)
+    for canonical, legacy in aliases.items():
+        if canonical not in normalized and legacy in normalized:
+            normalized[canonical] = normalized[legacy]
+        if legacy not in normalized and canonical in normalized:
+            normalized[legacy] = normalized[canonical]
+    return normalized
 
 
 # ============================================================
@@ -167,6 +229,153 @@ class PoolReader:
             name_b = RESOURCE_NAMES.get(res_b, str(res_b))
             rates[f"{name_a}_{name_b}"] = rate
         return rates
+
+
+class PlanetStateReader:
+    """读取并解析玩家的 planet_state 账户。"""
+
+    def __init__(self, rpc: Client, pdas: dict):
+        self.rpc = rpc
+        self.pdas = normalize_pdas(pdas)
+
+    def read(self) -> dict:
+        planet_state = Pubkey.from_string(self.pdas["planet_state"])
+        acct = self.rpc.get_account_info(planet_state, commitment=Confirmed)
+        if not acct.value:
+            raise RuntimeError("无法读取 planet_state 账户")
+
+        data = bytes(acct.value.data)
+        if len(data) < 236:
+            raise RuntimeError(f"planet_state 长度异常: {len(data)}")
+
+        offset = 8  # 跳过 Anchor discriminator
+        season_id = struct.unpack_from("<H", data, offset)[0]
+        offset += 2
+        leaderboard_points = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        planet_mint = str(Pubkey.from_bytes(data[offset : offset + 32]))
+        offset += 32
+        initializer = str(Pubkey.from_bytes(data[offset : offset + 32]))
+        offset += 32
+        planet_type = data[offset]
+        offset += 1
+        created_ts = struct.unpack_from("<q", data, offset)[0]
+        offset += 8
+        resources = [
+            struct.unpack_from("<Q", data, offset + i * 8)[0]
+            for i in range(4)
+        ]
+        offset += 32
+        last_claimed_ts = struct.unpack_from("<q", data, offset)[0]
+        offset += 8
+
+        buildings = []
+        for _ in range(9):
+            slot_resource = data[offset]
+            level = data[offset + 1]
+            last_upgrade_ts = struct.unpack_from("<q", data, offset + 2)[0]
+            offset += 10
+            buildings.append({
+                "resource": slot_resource,
+                "level": level,
+                "last_upgrade_ts": last_upgrade_ts,
+            })
+
+        energy = data[offset]
+        offset += 1
+        last_energy_ts = struct.unpack_from("<q", data, offset)[0]
+        offset += 8
+        mine_nonce = struct.unpack_from("<H", data, offset)[0]
+        offset += 2
+        stardust_exp = struct.unpack_from("<Q", data, offset)[0]
+
+        return {
+            "season_id": season_id,
+            "leaderboard_points": leaderboard_points,
+            "planet_mint": planet_mint,
+            "initializer": initializer,
+            "planet_type": planet_type,
+            "created_ts": created_ts,
+            "resources": dict(zip(RESOURCE_BALANCE_NAMES, resources)),
+            "last_claimed_ts": last_claimed_ts,
+            "buildings": buildings,
+            "energy": energy,
+            "last_energy_ts": last_energy_ts,
+            "mine_nonce": mine_nonce,
+            "stardust_exp": stardust_exp,
+        }
+
+
+class InventoryManager:
+    """根据资源仓位给交易机会打分，避免仓位长期单边失衡。"""
+
+    UTILITY_RESOURCES = ("Metal", "Gas", "Crystal")
+
+    def summarize(self, resources: dict) -> dict:
+        utility = {name: int(resources.get(name, 0)) for name in self.UTILITY_RESOURCES}
+        total = sum(utility.values())
+        if total <= 0:
+            weights = {name: 0.0 for name in self.UTILITY_RESOURCES}
+        else:
+            weights = {name: utility[name] / total for name in self.UTILITY_RESOURCES}
+
+        deviations = {
+            name: weights[name] - TARGET_RESOURCE_WEIGHTS[name]
+            for name in self.UTILITY_RESOURCES
+        }
+        return {
+            "balances": utility,
+            "total": total,
+            "weights": weights,
+            "deviations": deviations,
+        }
+
+    def evaluate_trade(self, sell: str, buy: str, profit: float, summary: dict) -> Optional[dict]:
+        sell_weight = summary["weights"].get(sell, 0.0)
+        buy_weight = summary["weights"].get(buy, 0.0)
+        sell_dev = summary["deviations"].get(sell, 0.0)
+        buy_dev = summary["deviations"].get(buy, 0.0)
+        crystal_weight = summary["weights"].get("Crystal", 0.0)
+        force_crystal_rebalance = (
+            crystal_weight >= FORCED_CRYSTAL_WEIGHT
+            and sell == "Crystal"
+            and buy in ("Metal", "Gas")
+        )
+
+        blocked = buy_weight >= MAX_RESOURCE_WEIGHT and buy_dev > 0
+        if blocked:
+            return None
+
+        bonus = max(sell_dev, 0.0) * SELL_OVERWEIGHT_BONUS
+        penalty = max(buy_dev, 0.0) * BUY_OVERWEIGHT_PENALTY
+        if force_crystal_rebalance:
+            bonus += 0.020
+        adjusted_profit = profit + bonus - penalty
+        rebalancing = sell_dev > 0 and buy_dev < 0
+        forced = force_crystal_rebalance
+        if forced:
+            min_profit = FORCED_REBALANCE_MIN_PROFIT
+            ratio = FORCED_REBALANCE_TRADE_RATIO
+        elif rebalancing:
+            min_profit = REBALANCE_MIN_PROFIT
+            ratio = REBALANCE_TRADE_RATIO
+        else:
+            min_profit = MIN_PROFIT
+            ratio = TRADE_RATIO
+
+        if adjusted_profit <= min_profit:
+            return None
+
+        return {
+            "profit": profit,
+            "adjusted_profit": adjusted_profit,
+            "rebalancing": rebalancing,
+            "forced": forced,
+            "sell_weight": sell_weight,
+            "buy_weight": buy_weight,
+            "ratio": ratio,
+            "sell_balance": summary["balances"].get(sell, 0),
+        }
 
 
 # ============================================================
@@ -237,32 +446,50 @@ class PDADiscovery:
                 return idx < n_sigs - n_ro_signed
             return idx < n_total - n_ro_unsigned
 
+        # 先找 swap 指令
+        swap_ix = None
+        collect_ix = None
         for ix in msg.instructions:
             raw = b58decode(ix.data)
-            if raw[:8] != SWAP_DISCRIMINATOR:
-                continue
+            if raw[:8] == SWAP_DISCRIMINATOR:
+                swap_ix = ix
+            elif raw[:8] == COLLECT_DISCRIMINATOR:
+                collect_ix = ix
 
-            names = ["signer", "player_entity", "player_component",
-                     "pool_state", "player_data", "user_state"]
-            pdas = {}
-            writable_flags = {}
+        if not swap_ix:
+            return None
 
-            for j, idx in enumerate(ix.accounts):
-                if j >= len(names):
+        # 提取 swap 指令的 PDA 和 writable 标记
+        swap_names = ["owner", "planet_state", "planet_nft",
+                      "trading_pools", "season", "session_token"]
+        pdas = {}
+        swap_writable = {}
+        for j, idx in enumerate(swap_ix.accounts):
+            if j >= len(swap_names):
+                break
+            name = swap_names[j]
+            pdas[name] = acct_keys[idx]
+            swap_writable[name] = is_writable(idx)
+        pdas["_writable"] = swap_writable
+
+        # 提取 collect 指令的 writable 标记
+        if collect_ix:
+            collect_names = ["owner", "planet_state", "planet_nft",
+                            "season", "session_token"]
+            collect_writable = {}
+            for j, idx in enumerate(collect_ix.accounts):
+                if j >= len(collect_names):
                     break
-                name = names[j]
-                pdas[name] = acct_keys[idx]
-                writable_flags[name] = is_writable(idx)
+                collect_writable[collect_names[j]] = is_writable(idx)
+            pdas["_collect_writable"] = collect_writable
+            log.info("找到 collect 指令 writable 标记")
 
-            pdas["_writable"] = writable_flags
+        log.info("找到 PDA（含 writable 标记）:")
+        for name in swap_names:
+            w = "W" if swap_writable.get(name) else "R"
+            log.info(f"  {name}: {pdas[name]}  [{w}]")
+        return normalize_pdas(pdas)
 
-            log.info("找到 PDA（含 writable 标记）:")
-            for name in names:
-                w = "W" if writable_flags.get(name) else "R"
-                log.info(f"  {name}: {pdas[name]}  [{w}]")
-            return pdas
-
-        return None
 
 
 # ============================================================
@@ -275,51 +502,146 @@ class SwapExecutor:
     def __init__(self, rpc: Client, keypair: Keypair, pdas: dict, dry_run=True):
         self.rpc = rpc
         self.keypair = keypair
-        self.pdas = pdas
+        self.pdas = normalize_pdas(pdas)
         self.dry_run = dry_run
-        # 从 pdas 中加载 writable 标记（来自真实交易）
-        self.writable = pdas.get("_writable", {})
+        self.swap_w = pdas.get("_writable", {})
+        self.collect_w = pdas.get("_collect_writable", {})
+
+    def _build_collect_ix(self) -> Instruction:
+        w = self.collect_w
+        accounts = [
+            AccountMeta(self.keypair.pubkey(),
+                        is_signer=True,
+                        is_writable=w.get("owner", w.get("signer", True))),
+            AccountMeta(Pubkey.from_string(self.pdas["planet_state"]),
+                        is_signer=False,
+                        is_writable=w.get("planet_state", w.get("player_entity", False))),
+            AccountMeta(Pubkey.from_string(self.pdas["planet_nft"]),
+                        is_signer=False,
+                        is_writable=w.get("planet_nft", w.get("player_component", False))),
+            AccountMeta(Pubkey.from_string(self.pdas["season"]),
+                        is_signer=False,
+                        is_writable=w.get("season", w.get("player_data", False))),
+            AccountMeta(Pubkey.from_string(self.pdas["session_token"]),
+                        is_signer=False,
+                        is_writable=w.get("session_token", w.get("user_state", False))),
+        ]
+        return Instruction(RESOURCE_PROGRAM, COLLECT_DISCRIMINATOR, accounts)
 
     def _build_swap_ix(self, sell_type: int, buy_type: int, amount: int) -> Instruction:
         swap_data = (SWAP_DISCRIMINATOR
                      + struct.pack('<BB', sell_type, buy_type)
                      + struct.pack('<Q', amount)
                      + struct.pack('<Q', 0))
-
-        w = self.writable
-
-        swap_accounts = [
+        w = self.swap_w
+        accounts = [
             AccountMeta(self.keypair.pubkey(),
                         is_signer=True,
-                        is_writable=w.get("signer", True)),
-            AccountMeta(Pubkey.from_string(self.pdas["player_entity"]),
+                        is_writable=w.get("owner", w.get("signer", True))),
+            AccountMeta(Pubkey.from_string(self.pdas["planet_state"]),
                         is_signer=False,
-                        is_writable=w.get("player_entity", False)),
-            AccountMeta(Pubkey.from_string(self.pdas["player_component"]),
+                        is_writable=w.get("planet_state", w.get("player_entity", False))),
+            AccountMeta(Pubkey.from_string(self.pdas["planet_nft"]),
                         is_signer=False,
-                        is_writable=w.get("player_component", False)),
+                        is_writable=w.get("planet_nft", w.get("player_component", False))),
             AccountMeta(POOL_STATE,
                         is_signer=False,
-                        is_writable=w.get("pool_state", True)),
-            AccountMeta(Pubkey.from_string(self.pdas["player_data"]),
+                        is_writable=w.get("trading_pools", w.get("pool_state", True))),
+            AccountMeta(Pubkey.from_string(self.pdas["season"]),
                         is_signer=False,
-                        is_writable=w.get("player_data", True)),
-            AccountMeta(Pubkey.from_string(self.pdas["user_state"]),
+                        is_writable=w.get("season", w.get("player_data", True))),
+            AccountMeta(Pubkey.from_string(self.pdas["session_token"]),
                         is_signer=False,
-                        is_writable=w.get("user_state", True)),
+                        is_writable=w.get("session_token", w.get("user_state", True))),
         ]
-        return Instruction(RESOURCE_PROGRAM, swap_data, swap_accounts)
+        return Instruction(RESOURCE_PROGRAM, swap_data, accounts)
 
-    def execute_swap(self, sell: str, buy: str, amount: int = SWAP_AMOUNT) -> Optional[str]:
+    def _build_swap_instructions(self, sell: str, buy: str, amount: int) -> List[Instruction]:
         sell_type = self.RES_MAP[sell]
         buy_type = self.RES_MAP[buy]
-        ix = self._build_swap_ix(sell_type, buy_type, amount)
+        return [
+            self._build_collect_ix(),
+            self._build_swap_ix(sell_type, buy_type, amount),
+        ]
+
+    def _simulate_swap(self, sell: str, buy: str, amount: int) -> tuple[bool, str]:
+        instructions = self._build_swap_instructions(sell, buy, amount)
+        try:
+            blockhash = self.rpc.get_latest_blockhash(Confirmed).value.blockhash
+            msg = Message.new_with_blockhash(instructions, self.keypair.pubkey(), blockhash)
+            tx = Transaction.new_unsigned(msg)
+            tx.sign([self.keypair], blockhash)
+            sim = self.rpc.simulate_transaction(tx)
+        except Exception as e:
+            return False, f"模拟异常: {e}"
+
+        if sim.value.err:
+            detail = str(sim.value.err)
+            logs = sim.value.logs or []
+            if logs:
+                detail = f"{detail} | {' | '.join(logs[-3:])}"
+            return False, detail
+        return True, "ok"
+
+    def can_trade_amount(self, sell: str, buy: str, amount: int) -> tuple[bool, str]:
+        return self._simulate_swap(sell, buy, amount)
+
+    def estimate_tradable_amount(self, sell: str, buy: str) -> int:
+        """
+        用模拟交易估算当前 sell→buy 方向可成交的上限。
+        这不是账户原始余额字段，而是综合用户余额和池子流动性后的可交易额度。
+        """
+        ok, detail = self._simulate_swap(sell, buy, MIN_TRADE_AMOUNT)
+        if not ok:
+            log.warning(f"  无法读取可交易额度，{MIN_TRADE_AMOUNT} 单位模拟失败: {detail}")
+            return 0
+
+        low = MIN_TRADE_AMOUNT
+        high = max(SWAP_AMOUNT, MIN_TRADE_AMOUNT)
+        while high < MAX_BALANCE_PROBE:
+            ok, _ = self._simulate_swap(sell, buy, high)
+            if not ok:
+                break
+            low = high
+            high *= 2
+
+        if high >= MAX_BALANCE_PROBE:
+            ok, _ = self._simulate_swap(sell, buy, MAX_BALANCE_PROBE)
+            if ok:
+                return MAX_BALANCE_PROBE
+
+        left = low + 1
+        right = min(high - 1, MAX_BALANCE_PROBE)
+        best = low
+        while left <= right:
+            mid = (left + right) // 2
+            ok, _ = self._simulate_swap(sell, buy, mid)
+            if ok:
+                best = mid
+                left = mid + 1
+            else:
+                right = mid - 1
+        return best
+
+    def plan_trade_amount(self, sell: str, buy: str, trade_ratio: float = TRADE_RATIO) -> tuple[int, int]:
+        available = self.estimate_tradable_amount(sell, buy)
+        if available <= 0:
+            return 0, 0
+
+        amount = int(available * trade_ratio)
+        amount = min(amount, available)
+        if available >= MIN_TRADE_AMOUNT:
+            amount = max(amount, MIN_TRADE_AMOUNT)
+        return amount, available
+
+    def execute_swap(self, sell: str, buy: str, amount: int = SWAP_AMOUNT) -> Optional[str]:
+        instructions = self._build_swap_instructions(sell, buy, amount)
 
         if self.dry_run:
             log.info(f"  [DRY-RUN] {sell} → {buy}, amount={amount}")
             try:
                 blockhash = self.rpc.get_latest_blockhash(Confirmed).value.blockhash
-                msg = Message.new_with_blockhash([ix], self.keypair.pubkey(), blockhash)
+                msg = Message.new_with_blockhash(instructions, self.keypair.pubkey(), blockhash)
                 tx = Transaction.new_unsigned(msg)
                 tx.sign([self.keypair], blockhash)
                 sim = self.rpc.simulate_transaction(tx)
@@ -337,7 +659,7 @@ class SwapExecutor:
 
         try:
             blockhash = self.rpc.get_latest_blockhash(Confirmed).value.blockhash
-            msg = Message.new_with_blockhash([ix], self.keypair.pubkey(), blockhash)
+            msg = Message.new_with_blockhash(instructions, self.keypair.pubkey(), blockhash)
             tx = Transaction.new_unsigned(msg)
             tx.sign([self.keypair], blockhash)
             result = self.rpc.send_transaction(tx)
@@ -362,9 +684,21 @@ class Bot:
         if not PDA_FILE.exists():
             log.error("请先运行: python colony_onchain.py discover")
             sys.exit(1)
-        self.pdas = json.loads(PDA_FILE.read_text())
+        self.pdas = normalize_pdas(json.loads(PDA_FILE.read_text()))
+
+        # 校验密钥与 signer 匹配
+        expected = self.pdas.get("owner", self.pdas.get("signer", ""))
+        actual = str(self.keypair.pubkey())
+        if expected and actual != expected:
+            log.error(f"密钥不匹配!")
+            log.error(f"  加载的公钥: {actual}")
+            log.error(f"  PDA signer: {expected}")
+            log.error("请检查 .env 中的私钥是否正确")
+            sys.exit(1)
 
         self.pool_reader = PoolReader(self.rpc)
+        self.planet_state_reader = PlanetStateReader(self.rpc, self.pdas)
+        self.inventory = InventoryManager()
         self.executor = SwapExecutor(self.rpc, self.keypair, self.pdas, dry_run)
         self.dry_run = dry_run
         self.cycle = 0
@@ -373,7 +707,11 @@ class Bot:
         mode = "DRY-RUN" if self.dry_run else "⚡ LIVE"
         log.info(f"启动链上套利监控 [{mode}]")
         log.info(f"钱包: {self.keypair.pubkey()}")
-        log.info(f"阈值: >{FEE*100:.1f}%手续费 | 间隔: {CHECK_INTERVAL_MIN}-{CHECK_INTERVAL_MAX}s | 每笔: {SWAP_AMOUNT}")
+        log.info(
+            f"阈值: >{FEE*100:.1f}%手续费 | 间隔: {CHECK_INTERVAL_MIN}-{CHECK_INTERVAL_MAX}s | "
+            f"下单比例: {TRADE_RATIO*100:.0f}%/{REBALANCE_TRADE_RATIO*100:.0f}%/{FORCED_REBALANCE_TRADE_RATIO*100:.0f}% | "
+            f"最小下单: {MIN_TRADE_AMOUNT}"
+        )
         log.info("Ctrl+C 停止\n")
 
         try:
@@ -388,6 +726,7 @@ class Bot:
         self.cycle += 1
         try:
             rates = self.pool_reader.get_rates()
+            state = self.planet_state_reader.read()
         except Exception as e:
             log.warning(f"[#{self.cycle}] 读取失败: {e}")
             return
@@ -396,10 +735,16 @@ class Bot:
             log.warning(f"[#{self.cycle}] 汇率不完整: {rates}")
             return
 
+        summary = self.inventory.summarize(state["resources"])
         rate_str = " | ".join(f"{k}: {v:.4f}" for k, v in rates.items())
         log.info(f"[#{self.cycle}] {rate_str}")
+        weight_str = " | ".join(
+            f"{name}:{summary['balances'][name]}({summary['weights'][name]*100:.1f}%)"
+            for name in InventoryManager.UTILITY_RESOURCES
+        )
+        log.info(f"  仓位: {weight_str}")
 
-        # 收集所有有利可图的交易机会
+        # 收集所有有利可图且有助于库存管理的交易机会
         fee_mul = 1 - FEE
         opportunities = []
         for pair, rate in rates.items():
@@ -407,23 +752,115 @@ class Bot:
             net_ab = rate * fee_mul
             net_ba = (1.0 / rate) * fee_mul
 
-            if net_ab > 1 + MIN_PROFIT:
-                profit = (net_ab - 1) * 100
-                opportunities.append((profit, res_a, res_b))
-            if net_ba > 1 + MIN_PROFIT:
-                profit = (net_ba - 1) * 100
-                opportunities.append((profit, res_b, res_a))
+            profit = net_ab - 1
+            decision = self.inventory.evaluate_trade(res_a, res_b, profit, summary)
+            if decision:
+                opportunities.append((profit * 100, res_a, res_b, decision))
+
+            profit = net_ba - 1
+            decision = self.inventory.evaluate_trade(res_b, res_a, profit, summary)
+            if decision:
+                opportunities.append((profit * 100, res_b, res_a, decision))
 
         if not opportunities:
+            log.info("  当前没有兼顾利润和仓位平衡的可执行机会")
             return
 
-        # 按利润从高到低排序
-        opportunities.sort(key=lambda x: x[0], reverse=True)
+        scored_opportunities = []
+        for raw_profit, sell, buy, decision in opportunities:
+            min_probe, min_probe_detail = self.executor.can_trade_amount(sell, buy, MIN_TRADE_AMOUNT)
+            if not min_probe:
+                scored_opportunities.append({
+                    "sell": sell,
+                    "buy": buy,
+                    "decision": decision,
+                    "raw_profit": raw_profit,
+                    "liquid": False,
+                    "reason": min_probe_detail,
+                })
+                continue
+
+            amount, available = self.executor.plan_trade_amount(
+                sell, buy, trade_ratio=decision["ratio"]
+            )
+            if amount < MIN_TRADE_AMOUNT:
+                scored_opportunities.append({
+                    "sell": sell,
+                    "buy": buy,
+                    "decision": decision,
+                    "raw_profit": raw_profit,
+                    "liquid": False,
+                    "reason": "计划数量低于最小下单量",
+                })
+                continue
+
+            expected_edge = amount * decision["adjusted_profit"]
+            scored_opportunities.append({
+                "sell": sell,
+                "buy": buy,
+                "decision": decision,
+                "raw_profit": raw_profit,
+                "amount": amount,
+                "available": available,
+                "expected_edge": expected_edge,
+                "liquid": True,
+            })
+
+        executable = [item for item in scored_opportunities if item["liquid"]]
+        if not executable:
+            for item in scored_opportunities:
+                if item["decision"]["forced"]:
+                    tag = "强制再平衡"
+                elif item["decision"]["rebalancing"]:
+                    tag = "再平衡"
+                else:
+                    tag = "套利"
+                log.info(f"  {item['sell']}→{item['buy']} {tag}方向当前不可执行")
+                if "InsufficientPoolLiquidity" in item["reason"]:
+                    log.info("  原因: 池子在这个方向上接不住最小交易量")
+                else:
+                    log.info(f"  原因: {item['reason']}")
+            log.info("  当前没有兼顾利润、仓位和成交量的可执行机会")
+            return
+
+        # 按预计收益额优先，其次按修正后利润率排序
+        executable.sort(
+            key=lambda item: (item["expected_edge"], item["decision"]["adjusted_profit"]),
+            reverse=True,
+        )
 
         # 依次尝试，失败就换下一个
-        for profit, sell, buy in opportunities:
-            log.info(f"  ★ {sell}→{buy} 净利润 {profit:.2f}%")
-            result = self.executor.execute_swap(sell, buy)
+        for item in executable:
+            sell = item["sell"]
+            buy = item["buy"]
+            decision = item["decision"]
+            raw_profit = item["raw_profit"]
+            amount = item["amount"]
+            available = item["available"]
+            adjusted_profit = decision["adjusted_profit"]
+            if decision["forced"]:
+                tag = "强制再平衡"
+            elif decision["rebalancing"]:
+                tag = "再平衡"
+            else:
+                tag = "套利"
+            log.info(
+                f"  ★ {sell}→{buy} 原始净利润 {raw_profit:.2f}% | "
+                f"综合分 {(adjusted_profit * 100):.2f}% | "
+                f"预计收益额 {item['expected_edge']:.1f} | {tag}"
+            )
+
+            if available >= MAX_BALANCE_PROBE:
+                available_text = f">={MAX_BALANCE_PROBE}"
+            else:
+                available_text = str(available)
+            log.info(
+                f"  {sell}→{buy} 当前可交易额度约 {available_text}，"
+                f"仓位 {decision['sell_weight']*100:.1f}%→{decision['buy_weight']*100:.1f}% ，"
+                f"本次下单 {amount}"
+            )
+
+            result = self.executor.execute_swap(sell, buy, amount=amount)
             if result:
                 return
             log.info(f"  {sell}→{buy} 失败，尝试下一对...")
@@ -459,6 +896,78 @@ def cmd_rates():
         print(f"  {res_a}/{res_b}: {rate:.6f}  卖{res_a}买{res_b}={status_ab}  卖{res_b}买{res_a}={status_ba}")
 
 
+def cmd_balances():
+    kp = load_keypair()
+    rpc = Client(RPC_URL)
+
+    if not PDA_FILE.exists():
+        print("user_pdas.json 不存在，请先运行 discover")
+        return
+
+    pdas = normalize_pdas(json.loads(PDA_FILE.read_text()))
+    expected = pdas.get("owner", pdas.get("signer", ""))
+    actual = str(kp.pubkey())
+    if expected and actual != expected:
+        print("密钥不匹配，无法读取当前钱包对应的 planet_state")
+        print(f"  加载的公钥: {actual}")
+        print(f"  PDA owner:   {expected}")
+        return
+
+    state = PlanetStateReader(rpc, pdas).read()
+    print("\n当前链上余额（planet_state.resources）:")
+    for name in RESOURCE_BALANCE_NAMES:
+        print(f"  {name}: {state['resources'][name]}")
+
+    print(f"\n附加信息:")
+    print(f"  season_id: {state['season_id']}")
+    print(f"  leaderboard_points: {state['leaderboard_points']}")
+    print(f"  planet_type: {state['planet_type']}")
+    print(f"  energy: {state['energy']}")
+    print(f"  stardust_exp: {state['stardust_exp']}")
+    print(f"  planet_mint: {state['planet_mint']}")
+    print("\n说明: 这里读取的是链上已记账资源；若游戏界面有尚未 claim 的产出，页面数值可能更高。")
+
+
+def cmd_verify():
+    """诊断密钥和交易"""
+    kp = load_keypair()
+    rpc = Client(RPC_URL)
+
+    print(f"\n1. 加载的公钥: {kp.pubkey()}")
+
+    if PDA_FILE.exists():
+        pdas = normalize_pdas(json.loads(PDA_FILE.read_text()))
+        signer = pdas.get("owner", pdas.get("signer", ""))
+        match = "[OK] 匹配" if str(kp.pubkey()) == signer else "[FAIL] 不匹配!"
+        print(f"   PDA signer:  {signer}")
+        print(f"   状态: {match}")
+
+        if str(kp.pubkey()) != signer:
+            print("\n   密钥不匹配！.env 中的私钥与游戏内 session key 不一致。")
+            print("   请重新从浏览器 IndexedDB 中提取正确的 session.privatekey")
+            return
+
+        w = pdas.get("_writable", {})
+        print(f"\n2. writable 标记: {json.dumps(w)}")
+
+        state = PlanetStateReader(rpc, pdas).read()
+        print(f"\n3. 当前链上余额:")
+        for name in RESOURCE_BALANCE_NAMES:
+            print(f"   {name}: {state['resources'][name]}")
+
+        print(f"\n4. 模拟 swap Metal→Gas...")
+        exe = SwapExecutor(rpc, kp, pdas, dry_run=True)
+        result = exe.execute_swap("Metal", "Gas", 100)
+        print(f"   结果: {'成功' if result else '失败'}")
+
+        print(f"\n5. 估算当前可交易额度...")
+        for sell, buy in [("Metal", "Gas"), ("Gas", "Crystal"), ("Crystal", "Metal")]:
+            amount = exe.estimate_tradable_amount(sell, buy)
+            print(f"   {sell}→{buy}: 约 {amount}")
+    else:
+        print("   user_pdas.json 不存在，请先运行 discover")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -467,13 +976,17 @@ def main():
     cmd = sys.argv[1].lower()
     if cmd == "discover":
         cmd_discover()
+    elif cmd == "balances":
+        cmd_balances()
     elif cmd == "rates":
         cmd_rates()
+    elif cmd == "verify":
+        cmd_verify()
     elif cmd == "monitor":
         live = "--live" in sys.argv
         Bot(dry_run=not live).run()
     else:
-        print(f"未知命令: {cmd}\n可用: discover | rates | monitor [--live]")
+        print(f"未知命令: {cmd}\n可用: discover | balances | rates | verify | monitor [--live]")
 
 
 if __name__ == "__main__":
