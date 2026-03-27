@@ -980,40 +980,63 @@ class Bot:
             log.info("  仓位平衡: 总资源量不足，跳过")
             return False
 
-        target_weight = 1.0 / 3
-        weights = summary["weights"]
-        max_res = max(weights, key=weights.get)
-        min_res = min(weights, key=weights.get)
-        deviation = weights[max_res] - weights[min_res]
+        target = total // 3
+        max_rounds = 3
+        did_trade = False
 
-        if deviation <= REBALANCE_DEVIATION:
+        for round_num in range(1, max_rounds + 1):
+            weights = {name: balances[name] / total for name in balances if total > 0}
+            max_res = max(weights, key=weights.get)
+            min_res = min(weights, key=weights.get)
+            deviation = weights[max_res] - weights[min_res]
+
+            if deviation <= REBALANCE_DEVIATION:
+                log.info(
+                    f"  仓位平衡: 偏差 {deviation*100:.1f}% <= {REBALANCE_DEVIATION*100:.0f}%，已平衡"
+                )
+                break
+
+            excess = balances[max_res] - target
+            deficit = target - balances[min_res]
+            amount = min(excess, deficit)
+            amount = max(amount, MIN_TRADE_AMOUNT)
+            amount = min(amount, balances[max_res])
+
+            if amount < MIN_TRADE_AMOUNT:
+                break
+
             log.info(
-                f"  仓位平衡: 偏差 {deviation*100:.1f}% <= {REBALANCE_DEVIATION*100:.0f}%，无需调整"
+                f"  ★ 仓位平衡[{round_num}/{max_rounds}] {max_res}→{min_res} | "
+                f"偏差 {deviation*100:.1f}% | 转移量 {amount}"
             )
-            return False
 
-        # 计算需要转移的数量：把最多的卖一部分换成最少的
-        excess = balances[max_res] - int(total * target_weight)
-        deficit = int(total * target_weight) - balances[min_res]
-        amount = min(excess, deficit)
-        amount = max(amount, MIN_TRADE_AMOUNT)
-        amount = min(amount, balances[max_res])
+            result = self.executor.execute_swap(max_res, min_res, amount=amount)
+            if not result:
+                log.info("  平衡交易失败，中止本轮平衡")
+                break
 
-        if amount < MIN_TRADE_AMOUNT:
-            return False
+            did_trade = True
 
-        log.info(
-            f"  ★ 仓位平衡 {max_res}→{min_res} | "
-            f"偏差 {deviation*100:.1f}% | 转移量 {amount}"
-        )
+            # 重新读取链上余额
+            try:
+                time.sleep(1.5)
+                state = self.planet_state_reader.read()
+                new_summary = self.inventory.summarize(state["resources"])
+                balances = new_summary["balances"]
+                total = new_summary["total"]
+                target = total // 3
+                weight_str = " | ".join(
+                    f"{name}:{balances[name]}({balances[name]/total*100:.1f}%)"
+                    for name in InventoryManager.UTILITY_RESOURCES
+                )
+                log.info(f"  平衡后仓位: {weight_str}")
+            except Exception as e:
+                log.warning(f"  读取平衡后余额失败: {e}")
+                break
 
-        result = self.executor.execute_swap(max_res, min_res, amount=amount)
-        if not result:
-            log.info("  平衡交易失败")
-            return False
-
-        log.info("  仓位平衡完成")
-        return True
+        if did_trade:
+            log.info("  仓位平衡完成")
+        return did_trade
 
     def _log_closest_position(self):
         if not self.positions:
