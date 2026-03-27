@@ -63,6 +63,8 @@ MAX_BALANCE_PROBE = 5_000_000
 MAX_CANDIDATES_TO_PROBE = 3
 OPEN_SPREAD_THRESHOLD = 0.01
 CLOSE_PROFIT_TARGET = 0.01
+REBALANCE_INTERVAL = 3600
+REBALANCE_DEVIATION = 0.10
 MINE_SCAN_PAGES = 5
 MINE_SCAN_PAGE_SIZE = 100
 CRIT_MULTIPLIER_THRESHOLD = 1000
@@ -905,6 +907,7 @@ class Bot:
         self.dry_run = dry_run
         self.cycle = 0
         self.positions = load_positions()
+        self.last_rebalance_time = 0
 
     def run(self):
         mode = "DRY-RUN" if self.dry_run else "⚡ LIVE"
@@ -919,6 +922,10 @@ class Bot:
         )
         log.info(
             f"平仓条件: 已买入资产按记录数量换回时，能换到不少于开仓卖出量的 {100 + CLOSE_PROFIT_TARGET*100:.1f}%"
+        )
+        log.info(
+            f"仓位平衡: 启动时执行 + 每 {REBALANCE_INTERVAL}s | "
+            f"偏差阈值: {REBALANCE_DEVIATION*100:.0f}%"
         )
         log.info("Ctrl+C 停止\n")
 
@@ -955,10 +962,58 @@ class Bot:
         log.info(f"  当前未平仓记录: {len(self.positions)}")
         self._log_closest_position()
 
+        now = time.time()
+        if now - self.last_rebalance_time >= REBALANCE_INTERVAL:
+            if self._try_rebalance(summary):
+                self.last_rebalance_time = now
+                return
+
         if self._try_close_position(summary, before_total):
             return
 
         self._try_open_position(rates, summary, before_total)
+
+    def _try_rebalance(self, summary: dict) -> bool:
+        balances = summary["balances"]
+        total = summary["total"]
+        if total < MIN_TRADE_AMOUNT * 3:
+            log.info("  仓位平衡: 总资源量不足，跳过")
+            return False
+
+        target_weight = 1.0 / 3
+        weights = summary["weights"]
+        max_res = max(weights, key=weights.get)
+        min_res = min(weights, key=weights.get)
+        deviation = weights[max_res] - weights[min_res]
+
+        if deviation <= REBALANCE_DEVIATION:
+            log.info(
+                f"  仓位平衡: 偏差 {deviation*100:.1f}% <= {REBALANCE_DEVIATION*100:.0f}%，无需调整"
+            )
+            return False
+
+        # 计算需要转移的数量：把最多的卖一部分换成最少的
+        excess = balances[max_res] - int(total * target_weight)
+        deficit = int(total * target_weight) - balances[min_res]
+        amount = min(excess, deficit)
+        amount = max(amount, MIN_TRADE_AMOUNT)
+        amount = min(amount, balances[max_res])
+
+        if amount < MIN_TRADE_AMOUNT:
+            return False
+
+        log.info(
+            f"  ★ 仓位平衡 {max_res}→{min_res} | "
+            f"偏差 {deviation*100:.1f}% | 转移量 {amount}"
+        )
+
+        result = self.executor.execute_swap(max_res, min_res, amount=amount)
+        if not result:
+            log.info("  平衡交易失败")
+            return False
+
+        log.info("  仓位平衡完成")
+        return True
 
     def _log_closest_position(self):
         if not self.positions:
