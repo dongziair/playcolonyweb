@@ -13,12 +13,15 @@ PlayColony 链上自动套利脚本
 """
 
 import json
+import math
 import struct
 import time
 import sys
 import os
 import logging
 import random
+import re
+import statistics
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List
@@ -54,18 +57,22 @@ MIN_PROFIT = 0.0
 CHECK_INTERVAL_MIN = 1
 CHECK_INTERVAL_MAX = 2
 SWAP_AMOUNT = 1000
-TRADE_RATIO = 0.30
-HIGH_EDGE_TRADE_RATIO = 0.50
+TRADE_RATIO = 0.15
 MIN_TRADE_AMOUNT = 100
 MAX_BALANCE_PROBE = 5_000_000
 MAX_CANDIDATES_TO_PROBE = 3
-HIGH_EDGE_PROFIT_THRESHOLD = 0.02
+OPEN_SPREAD_THRESHOLD = 0.02
+CLOSE_PROFIT_TARGET = 0.02
+MINE_SCAN_PAGES = 5
+MINE_SCAN_PAGE_SIZE = 100
+CRIT_MULTIPLIER_THRESHOLD = 1000
 
 # 文件路径
 BASE_DIR = Path(__file__).parent
 ENV_FILE = BASE_DIR / ".env"
 PDA_FILE = BASE_DIR / "user_pdas.json"
 LOG_FILE = BASE_DIR / "onchain_log.txt"
+POSITIONS_FILE = BASE_DIR / "swap_positions.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -316,7 +323,7 @@ class InventoryManager:
         }
 
     def evaluate_trade(self, sell: str, buy: str, profit: float, summary: dict) -> Optional[dict]:
-        if profit <= HIGH_EDGE_PROFIT_THRESHOLD:
+        if profit <= OPEN_SPREAD_THRESHOLD:
             return None
 
         return {
@@ -327,7 +334,7 @@ class InventoryManager:
             "replenish": False,
             "sell_weight": summary["weights"].get(sell, 0.0),
             "buy_weight": summary["weights"].get(buy, 0.0),
-            "ratio": HIGH_EDGE_TRADE_RATIO,
+            "ratio": TRADE_RATIO,
             "sell_balance": summary["balances"].get(sell, 0),
         }
 
@@ -537,6 +544,38 @@ class SwapExecutor:
             return False, detail
         return True, "ok"
 
+    def quote_swap(self, sell: str, buy: str, amount: int) -> Optional[dict]:
+        instructions = self._build_swap_instructions(sell, buy, amount)
+        try:
+            blockhash = self.rpc.get_latest_blockhash(Confirmed).value.blockhash
+            msg = Message.new_with_blockhash(instructions, self.keypair.pubkey(), blockhash)
+            tx = Transaction.new_unsigned(msg)
+            tx.sign([self.keypair], blockhash)
+            sim = self.rpc.simulate_transaction(tx)
+        except Exception as e:
+            log.warning(f"  报价模拟异常: {e}")
+            return None
+
+        if sim.value.err:
+            logs = sim.value.logs or []
+            detail = str(sim.value.err)
+            if logs:
+                detail = f"{detail} | {' | '.join(logs[-3:])}"
+            log.warning(f"  报价模拟失败: {detail}")
+            return None
+
+        logs = sim.value.logs or []
+        for line in logs:
+            match = SWAP_RESULT_RE.search(line)
+            if match:
+                return {
+                    "amount_in": int(match.group(1)),
+                    "asset_in": int(match.group(2)),
+                    "amount_out": int(match.group(3)),
+                    "asset_out": int(match.group(4)),
+                }
+        return None
+
     def can_trade_amount(self, sell: str, buy: str, amount: int) -> tuple[bool, str]:
         return self._simulate_swap(sell, buy, amount)
 
@@ -625,6 +664,164 @@ class SwapExecutor:
             return None
 
 
+MINE_DEBUG_RE = re.compile(
+    r"nonce=(\d+), daily_production=(\d+), base_yield=(\d+), multiplier=(\d+), total=(\d+)"
+)
+MINE_RESULT_RE = re.compile(
+    r"Mined resource (\d+).* yield: (\d+), energy: (\d+)"
+)
+SWAP_RESULT_RE = re.compile(
+    r"Swapped (\d+) of asset (\d+) for (\d+) of asset (\d+)"
+)
+
+
+def _parse_int_arg(flag: str, default: int) -> int:
+    if flag not in sys.argv:
+        return default
+    idx = sys.argv.index(flag)
+    if idx + 1 >= len(sys.argv):
+        raise ValueError(f"{flag} 缺少数值")
+    return int(sys.argv[idx + 1])
+
+
+def _parse_mine_row(tx_value) -> Optional[dict]:
+    if not tx_value or not tx_value.transaction.meta or not tx_value.transaction.meta.log_messages:
+        return None
+
+    logs = tx_value.transaction.meta.log_messages
+    joined = "\n".join(logs)
+    if "Instruction: Mine" not in joined:
+        return None
+
+    debug = MINE_DEBUG_RE.search(joined)
+    if not debug:
+        return None
+
+    result = MINE_RESULT_RE.search(joined)
+    account_keys = tx_value.transaction.transaction.message.account_keys
+    planet_state = str(account_keys[1]) if len(account_keys) > 1 else ""
+    owner = str(account_keys[0]) if account_keys else ""
+
+    return {
+        "slot": tx_value.slot,
+        "block_time": tx_value.block_time,
+        "owner": owner,
+        "planet_state": planet_state,
+        "nonce": int(debug.group(1)),
+        "daily_production": int(debug.group(2)),
+        "base_yield": int(debug.group(3)),
+        "multiplier": int(debug.group(4)),
+        "total": int(debug.group(5)),
+        "resource": int(result.group(1)) if result else None,
+        "energy": int(result.group(3)) if result else None,
+    }
+
+
+def load_positions() -> List[dict]:
+    if not POSITIONS_FILE.exists():
+        return []
+    try:
+        data = json.loads(POSITIONS_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        log.warning("持仓文件损坏，已忽略旧内容")
+        return []
+    return data if isinstance(data, list) else []
+
+
+def save_positions(positions: List[dict]):
+    POSITIONS_FILE.write_text(
+        json.dumps(positions, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def calc_close_target_amount(amount_in: int) -> int:
+    return max(MIN_TRADE_AMOUNT, math.ceil(amount_in * (1 + CLOSE_PROFIT_TARGET)))
+
+
+def cmd_analyze_mine():
+    pages = _parse_int_arg("--pages", MINE_SCAN_PAGES)
+    page_size = _parse_int_arg("--page-size", MINE_SCAN_PAGE_SIZE)
+    crit_threshold = _parse_int_arg("--crit-threshold", CRIT_MULTIPLIER_THRESHOLD)
+
+    rpc = Client(RPC_URL)
+    rows = []
+    before = None
+    fetched_sigs = 0
+
+    print("\n扫描全链 Mine 交易中...")
+    print(f"  pages={pages}, page_size={page_size}, crit_threshold={crit_threshold}")
+
+    for page in range(pages):
+        sigs = rpc.get_signatures_for_address(RESOURCE_PROGRAM, before=before, limit=page_size).value
+        if not sigs:
+            break
+        fetched_sigs += len(sigs)
+        before = sigs[-1].signature
+
+        for sig_info in sigs:
+            tx = rpc.get_transaction(sig_info.signature, max_supported_transaction_version=0).value
+            row = _parse_mine_row(tx)
+            if row:
+                row["signature"] = str(sig_info.signature)
+                rows.append(row)
+
+        print(f"  第 {page + 1} 页完成，累计签名 {fetched_sigs}，Mine 样本 {len(rows)}")
+
+    if not rows:
+        print("\n未找到 Mine 样本。")
+        print("说明: 当前 RPC 可访问历史里没有解析到 Mine，或历史范围不足。")
+        return
+
+    rows.sort(key=lambda r: (r["slot"], r["nonce"]))
+    multipliers = [r["multiplier"] for r in rows]
+    crits = [r for r in rows if r["multiplier"] >= crit_threshold]
+    highs = [r for r in rows if 115 <= r["multiplier"] < crit_threshold]
+    unique_planets = len({r["planet_state"] for r in rows if r["planet_state"]})
+    unique_owners = len({r["owner"] for r in rows if r["owner"]})
+
+    print("\n全链 Mine 概况:")
+    print(f"  Mine 样本数: {len(rows)}")
+    print(f"  涉及 planet_state 数: {unique_planets}")
+    print(f"  涉及 owner 数: {unique_owners}")
+    print(f"  multiplier 最小/中位/平均/最大: {min(multipliers)} / {statistics.median(multipliers)} / {statistics.mean(multipliers):.2f} / {max(multipliers)}")
+    print(f"  暴击样本数(multiplier>={crit_threshold}): {len(crits)}")
+    print(f"  高倍率样本数(115-{crit_threshold - 1}): {len(highs)}")
+
+    if crits:
+        print("\n暴击样本:")
+        for row in crits[:20]:
+            ts = datetime.fromtimestamp(row["block_time"]).isoformat(sep=" ") if row["block_time"] else "unknown"
+            print(
+                f"  nonce={row['nonce']} mult={row['multiplier']} total={row['total']} "
+                f"resource={row['resource']} energy={row['energy']} time={ts}"
+            )
+            print(f"    sig={row['signature']}")
+    else:
+        print("\n暴击样本: 当前扫描范围内没有命中。")
+
+    if highs:
+        print("\n高倍率样本(>=115):")
+        for row in highs[:20]:
+            print(
+                f"  nonce={row['nonce']} mult={row['multiplier']} total={row['total']} "
+                f"resource={row['resource']} energy={row['energy']}"
+            )
+
+    high_nonce_mod = [(r["nonce"] % 10, r["nonce"], r["multiplier"]) for r in highs + crits]
+    if high_nonce_mod:
+        print("\n高倍率 nonce 尾数:")
+        print("  " + ", ".join(f"{mod}->{nonce}/{mult}" for mod, nonce, mult in high_nonce_mod[:40]))
+
+    print("\n初步判断:")
+    if len(crits) <= 1:
+        print("  暴击样本太少，还看不出稳定规律。")
+        print("  现阶段更像是程序内部随机结果，而不是固定 nonce 周期。")
+    else:
+        print("  已有多个暴击样本，可以进一步检验是否和 nonce、energy、resource 有相关性。")
+    print("  如果要继续逼近规律，建议把 pages 提高到 20 以上，扩大样本。")
+
+
 # ============================================================
 # Bot 主循环
 # ============================================================
@@ -656,6 +853,7 @@ class Bot:
         self.executor = SwapExecutor(self.rpc, self.keypair, self.pdas, dry_run)
         self.dry_run = dry_run
         self.cycle = 0
+        self.positions = load_positions()
 
     def run(self):
         mode = "DRY-RUN" if self.dry_run else "⚡ LIVE"
@@ -663,11 +861,13 @@ class Bot:
         log.info(f"钱包: {self.keypair.pubkey()}")
         log.info(
             f"阈值: >{FEE*100:.1f}%手续费 | 间隔: {CHECK_INTERVAL_MIN}-{CHECK_INTERVAL_MAX}s | "
-            f"下单比例: {HIGH_EDGE_TRADE_RATIO*100:.0f}% | "
-            f"最小下单: {MIN_TRADE_AMOUNT} | 候选探测数: {MAX_CANDIDATES_TO_PROBE}"
+            f"每次交易余额比例: {TRADE_RATIO*100:.0f}% | 最小下单: {MIN_TRADE_AMOUNT}"
         )
         log.info(
-            f"触发条件: 总和收益率 > {HIGH_EDGE_PROFIT_THRESHOLD*100:.1f}%，并选择预计收益额最高的一组"
+            f"开仓条件: 总和收益率 > {OPEN_SPREAD_THRESHOLD*100:.1f}%"
+        )
+        log.info(
+            f"平仓条件: 已买入资产按记录数量换回时，能换到不少于开仓卖出量的 {100 + CLOSE_PROFIT_TARGET*100:.1f}%"
         )
         log.info("Ctrl+C 停止\n")
 
@@ -701,138 +901,165 @@ class Bot:
             for name in InventoryManager.UTILITY_RESOURCES
         )
         log.info(f"  仓位: {weight_str}")
+        log.info(f"  当前未平仓记录: {len(self.positions)}")
+        self._log_closest_position()
 
-        # 只做总和收益率大于阈值的方向
-        fee_mul = 1 - FEE
-        opportunities = []
-        for pair, rate in rates.items():
-            res_a, res_b = pair.split("_")
-            net_ab = rate * fee_mul
-            net_ba = (1.0 / rate) * fee_mul
-
-            profit = net_ab - 1
-            decision = self.inventory.evaluate_trade(res_a, res_b, profit, summary)
-            if decision:
-                opportunities.append((profit * 100, res_a, res_b, decision))
-
-            profit = net_ba - 1
-            decision = self.inventory.evaluate_trade(res_b, res_a, profit, summary)
-            if decision:
-                opportunities.append((profit * 100, res_b, res_a, decision))
-
-        if not opportunities:
-            log.info("  当前没有总和收益率超过阈值的方向")
+        if self._try_close_position(summary, before_total):
             return
 
-        high_edge_candidates = [
-            (raw_profit, sell, buy, decision)
-            for raw_profit, sell, buy, decision in opportunities
-            if (raw_profit / 100) > HIGH_EDGE_PROFIT_THRESHOLD
-        ]
-        if not high_edge_candidates:
-            log.info("  跳过本轮，没有方向的总和收益率超过 2.0%")
+        self._try_open_position(rates, summary, before_total)
+
+    def _log_closest_position(self):
+        if not self.positions:
             return
 
-        rough_ranked = []
-        for raw_profit, sell, buy, decision in high_edge_candidates:
-            decision = dict(decision)
-            decision["ratio"] = HIGH_EDGE_TRADE_RATIO
-            rough_available = max(0, decision["sell_balance"])
-            rough_amount = min(
-                rough_available,
-                max(MIN_TRADE_AMOUNT, int(rough_available * decision["ratio"])) if rough_available else 0,
-            )
-            rough_edge = rough_amount * (raw_profit / 100)
-            rough_ranked.append((rough_edge, decision["priority_bonus"], raw_profit, sell, buy, decision))
-
-        rough_ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        rough_ranked = rough_ranked[:max(1, MAX_CANDIDATES_TO_PROBE)]
-
-        scored_opportunities = []
-        for _, _, raw_profit, sell, buy, decision in rough_ranked:
-            min_probe, min_probe_detail = self.executor.can_trade_amount(sell, buy, MIN_TRADE_AMOUNT)
-            if not min_probe:
-                scored_opportunities.append({
-                    "sell": sell,
-                    "buy": buy,
-                    "decision": decision,
-                    "raw_profit": raw_profit,
-                    "liquid": False,
-                    "reason": min_probe_detail,
-                })
+        checks = []
+        for position in self.positions:
+            amount_out = int(position.get("amount_out", 0))
+            if amount_out < MIN_TRADE_AMOUNT:
                 continue
 
-            amount, available = self.executor.plan_trade_amount(
-                sell, buy, trade_ratio=decision["ratio"]
+            quote = self.executor.quote_swap(
+                position["buy_resource"],
+                position["sell_resource"],
+                amount_out,
             )
-            if amount < MIN_TRADE_AMOUNT:
-                scored_opportunities.append({
-                    "sell": sell,
-                    "buy": buy,
-                    "decision": decision,
-                    "raw_profit": raw_profit,
-                    "liquid": False,
-                    "reason": "计划数量低于最小下单量",
-                })
+            if not quote:
                 continue
 
-            expected_edge = amount * (raw_profit / 100)
-            scored_opportunities.append({
-                "sell": sell,
-                "buy": buy,
-                "decision": decision,
-                "raw_profit": raw_profit,
-                "amount": amount,
-                "available": available,
-                "expected_edge": expected_edge,
-                "liquid": True,
-            })
+            target_amount_back = calc_close_target_amount(int(position["amount_in"]))
+            gap = quote["amount_out"] - target_amount_back
+            checks.append((gap, position, quote, target_amount_back))
 
-        executable = [item for item in scored_opportunities if item["liquid"]]
-        if not executable:
-            for item in scored_opportunities:
-                log.info(f"  {item['sell']}→{item['buy']} 方向当前不可执行")
-                if "InsufficientPoolLiquidity" in item["reason"]:
-                    log.info("  原因: 池子在这个方向上接不住最小交易量")
-                else:
-                    log.info(f"  原因: {item['reason']}")
-            log.info("  当前没有满足收益阈值且可成交的方向")
+        if not checks:
+            log.info("  持仓检查: 当前没有可报价的平仓候选")
             return
 
-        # 按预计总和收益额优先
-        executable.sort(
-            key=lambda item: (item["expected_edge"], item["decision"]["priority_bonus"]),
-            reverse=True,
+        gap, position, quote, target_amount_back = max(checks, key=lambda item: item[0])
+        status = "已满足平仓条件" if gap >= 0 else f"还差 {-gap} {position['sell_resource']}"
+        log.info(
+            f"  最接近平仓: {position['buy_resource']}→{position['sell_resource']} | "
+            f"{position['amount_out']} {position['buy_resource']} 现在可换 {quote['amount_out']} {position['sell_resource']} | "
+            f"目标 {target_amount_back} | {status}"
         )
 
-        # 依次尝试，失败就换下一个
-        for item in executable:
-            sell = item["sell"]
-            buy = item["buy"]
-            decision = item["decision"]
-            raw_profit = item["raw_profit"]
-            amount = item["amount"]
-            available = item["available"]
-            log.info(
-                f"  ★ {sell}→{buy} 总和收益率 {raw_profit:.2f}% | "
-                f"预计收益额 {item['expected_edge']:.1f}"
-            )
+    def _try_close_position(self, summary: dict, before_total: int) -> bool:
+        closable = []
+        for idx, position in enumerate(self.positions):
+            held = summary["balances"].get(position["buy_resource"], 0)
+            required_amount = int(position["amount_out"])
+            if held < required_amount or required_amount < MIN_TRADE_AMOUNT:
+                continue
 
-            if available >= MAX_BALANCE_PROBE:
-                available_text = f">={MAX_BALANCE_PROBE}"
-            else:
-                available_text = str(available)
-            log.info(
-                f"  {sell}→{buy} 当前可交易额度约 {available_text}，"
-                f"仓位 {decision['sell_weight']*100:.1f}%→{decision['buy_weight']*100:.1f}% ，"
-                f"本次下单 {amount}"
+            quote = self.executor.quote_swap(
+                position["buy_resource"],
+                position["sell_resource"],
+                required_amount,
             )
+            if not quote:
+                continue
 
-            result = self.executor.execute_swap(sell, buy, amount=amount)
-            if result:
-                self._log_realized_edge(before_total, sell, buy, amount)
-                return
-            log.info(f"  {sell}→{buy} 失败，尝试下一对...")
+            target_amount_back = calc_close_target_amount(int(position["amount_in"]))
+            if quote["amount_out"] >= target_amount_back:
+                closable.append({
+                    "index": idx,
+                    "position": position,
+                    "quote": quote,
+                    "surplus": quote["amount_out"] - target_amount_back,
+                })
+
+        if not closable:
+            return False
+
+        closable.sort(key=lambda item: (item["surplus"], item["quote"]["amount_out"]), reverse=True)
+        item = closable[0]
+        position = item["position"]
+        quote = item["quote"]
+        amount = int(position["amount_out"])
+
+        log.info(
+            f"  ★ 平仓 {position['buy_resource']}→{position['sell_resource']} | "
+            f"{amount} {position['buy_resource']} 预计换回 {quote['amount_out']} {position['sell_resource']}"
+        )
+
+        result = self.executor.execute_swap(position["buy_resource"], position["sell_resource"], amount=amount)
+        if not result:
+            log.info("  平仓失败，等待下一轮")
+            return False
+
+        if not self.dry_run:
+            self.positions.pop(item["index"])
+            save_positions(self.positions)
+        self._log_realized_edge(before_total, position["buy_resource"], position["sell_resource"], amount)
+        return True
+
+    def _try_open_position(self, rates: Dict[str, float], summary: dict, before_total: int):
+        fee_mul = 1 - FEE
+        candidates = []
+        for pair, rate in rates.items():
+            res_a, res_b = pair.split("_")
+            for sell, buy, net_rate in (
+                (res_a, res_b, rate * fee_mul),
+                (res_b, res_a, (1.0 / rate) * fee_mul),
+            ):
+                spread = net_rate - 1
+                if spread <= OPEN_SPREAD_THRESHOLD:
+                    continue
+
+                balance = summary["balances"].get(sell, 0)
+                if balance < MIN_TRADE_AMOUNT:
+                    continue
+
+                amount = int(balance * TRADE_RATIO)
+                amount = min(balance, max(amount, MIN_TRADE_AMOUNT))
+                if amount < MIN_TRADE_AMOUNT:
+                    continue
+
+                quote = self.executor.quote_swap(sell, buy, amount)
+                if not quote:
+                    continue
+
+                expected_edge = quote["amount_out"] - quote["amount_in"]
+                candidates.append({
+                    "sell": sell,
+                    "buy": buy,
+                    "spread": spread * 100,
+                    "amount_in": quote["amount_in"],
+                    "amount_out": quote["amount_out"],
+                    "expected_edge": expected_edge,
+                })
+
+        if not candidates:
+            log.info(f"  当前没有总和收益率超过 {OPEN_SPREAD_THRESHOLD*100:.1f}% 的方向")
+            return
+
+        candidates.sort(key=lambda item: (item["expected_edge"], item["spread"]), reverse=True)
+        best = candidates[0]
+        log.info(
+            f"  ★ 开仓 {best['sell']}→{best['buy']} | "
+            f"总和收益率 {best['spread']:.2f}% | "
+            f"记录价格 {best['amount_in']} {best['sell']} → {best['amount_out']} {best['buy']}"
+        )
+
+        result = self.executor.execute_swap(best["sell"], best["buy"], amount=best["amount_in"])
+        if not result:
+            log.info("  开仓失败，等待下一轮")
+            return
+
+        if not self.dry_run:
+            position = {
+                "opened_at": datetime.now().isoformat(),
+                "sell_resource": best["sell"],
+                "buy_resource": best["buy"],
+                "amount_in": best["amount_in"],
+                "amount_out": best["amount_out"],
+                "target_amount_back": calc_close_target_amount(best["amount_in"]),
+                "entry_spread_pct": best["spread"],
+                "open_tx": result,
+            }
+            self.positions.append(position)
+            save_positions(self.positions)
+        self._log_realized_edge(before_total, best["sell"], best["buy"], best["amount_in"])
 
     def _log_realized_edge(self, before_total: int, sell: str, buy: str, amount: int):
         if self.dry_run:
@@ -922,6 +1149,45 @@ def cmd_balances():
     print("\n说明: 这里读取的是链上已记账资源；若游戏界面有尚未 claim 的产出，页面数值可能更高。")
 
 
+def cmd_positions():
+    positions = load_positions()
+    if not positions:
+        print("\n当前没有未平仓记录。")
+        return
+
+    do_check = "--check" in sys.argv
+    rpc = Client(RPC_URL) if do_check else None
+    kp = load_keypair() if do_check else None
+    pdas = normalize_pdas(json.loads(PDA_FILE.read_text())) if do_check and PDA_FILE.exists() else None
+    exe = SwapExecutor(rpc, kp, pdas, dry_run=True) if do_check and rpc and kp and pdas else None
+
+    print(f"\n当前未平仓记录: {len(positions)}")
+    for idx, pos in enumerate(positions, 1):
+        opened_at = pos.get("opened_at", "unknown")
+        sell = pos.get("sell_resource", "?")
+        buy = pos.get("buy_resource", "?")
+        amount_in = pos.get("amount_in", 0)
+        amount_out = pos.get("amount_out", 0)
+        target_back = calc_close_target_amount(int(amount_in))
+        spread = pos.get("entry_spread_pct", 0.0)
+        tx = pos.get("open_tx", "")
+        print(f"\n[{idx}] {sell} → {buy}")
+        print(f"  开仓时间: {opened_at}")
+        print(f"  记录价格: {amount_in} {sell} → {amount_out} {buy}")
+        print(f"  平仓目标: {amount_out} {buy} → 至少 {target_back} {sell} (+{CLOSE_PROFIT_TARGET*100:.1f}%)")
+        print(f"  开仓总和收益率: {spread:.2f}%")
+        if tx:
+            print(f"  开仓交易: {tx}")
+        if exe:
+            quote = exe.quote_swap(buy, sell, int(amount_out))
+            if quote:
+                gap = quote["amount_out"] - target_back
+                status = "已满足平仓条件" if gap >= 0 else f"还差 {-gap} {sell}"
+                print(f"  当前检查: {amount_out} {buy} → {quote['amount_out']} {sell}，{status}")
+            else:
+                print("  当前检查: 无法获取反向报价")
+
+
 def cmd_verify():
     """诊断密钥和交易"""
     kp = load_keypair()
@@ -970,6 +1236,10 @@ def main():
     cmd = sys.argv[1].lower()
     if cmd == "discover":
         cmd_discover()
+    elif cmd == "analyze-mine":
+        cmd_analyze_mine()
+    elif cmd == "positions":
+        cmd_positions()
     elif cmd == "balances":
         cmd_balances()
     elif cmd == "rates":
@@ -980,7 +1250,7 @@ def main():
         live = "--live" in sys.argv
         Bot(dry_run=not live).run()
     else:
-        print(f"未知命令: {cmd}\n可用: discover | balances | rates | verify | monitor [--live]")
+        print(f"未知命令: {cmd}\n可用: discover | analyze-mine [--pages N] [--page-size N] [--crit-threshold N] | positions [--check] | balances | rates | verify | monitor [--live]")
 
 
 if __name__ == "__main__":
