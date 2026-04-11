@@ -25,8 +25,20 @@ req.onsuccess = () => {
   get.onsuccess = () => {
     const data = get.result;
     if (data && data.contents) {
-      const text = new TextDecoder().decode(data.contents);
-      console.log(text);
+      const raw = new Uint8Array(data.contents);
+      const text = new TextDecoder().decode(raw);
+      // Unity PlayerPrefs 格式：每个值前面有一个长度前缀字节
+      // 需要按 key 名查找，然后跳过长度前缀读取值
+      const keys = ['session.privatekey', 'session.publickey'];
+      for (const k of keys) {
+        const idx = text.indexOf(k);
+        if (idx < 0) continue;
+        const valueStart = idx + k.length;
+        // valueStart 位置的字符是长度前缀（ASCII 值 = 字符串长度）
+        const len = raw[new TextEncoder().encode(text.substring(0, valueStart)).length];
+        const value = text.substring(valueStart + 1, valueStart + 1 + len);
+        console.log(k + ' = ' + value);
+      }
     } else {
       console.log('未找到，原始数据:', data);
     }
@@ -34,31 +46,24 @@ req.onsuccess = () => {
 };
 ```
 
-在输出的 PlayerPrefs 内容中查找包含 `privatekey` 或 `session` 的字段，复制对应的 base58 字符串。
+### 4. 填入 .env 文件
 
-### 4. 也可以手动查看
-
-1. 开发者工具 → **Application** 标签页
-2. 左侧 **IndexedDB** → 展开 `/idbfs`
-3. 点击 `FILE_DATA`
-4. 找到 key 为 `/idbfs/33449c7f0276bb3b68e51256fd0ddcb8/PlayerPrefs` 的条目
-5. 查看 `contents` 字段中的私钥
-
-### 5. 填入 .env 文件
+将打印出的 `session.privatekey` 值（不含长度前缀）填入：
 
 ```
 COLONY_PRIVATE_KEY=你的base58私钥
 ```
 
-### 6. 验证
+### 5. 验证
 
 ```bash
-python colony_onchain.py verify
+python colony_onchain.py discover
 ```
 
-输出 `[OK] 匹配` 即表示私钥正确。
+输出的公钥应与 `session.publickey` 一致。
 
 ## 注意事项
 
 - Session Key 可能会过期，如果报错 `密钥不匹配`，需要重新提取
 - 私钥请妥善保管，不要泄露
+- Unity PlayerPrefs 中每个值前面有一个**长度前缀字节**（该字节的 ASCII 值等于后面字符串的长度），提取时需要跳过

@@ -192,11 +192,12 @@ def normalize_pdas(pdas: dict) -> dict:
 
 class PoolReader:
 
-    def __init__(self, rpc: Client):
+    def __init__(self, rpc: Client, pool_pubkey: Pubkey = None):
         self.rpc = rpc
+        self.pool_pubkey = pool_pubkey or POOL_STATE
 
     def read_pool_data(self) -> bytes:
-        acct = self.rpc.get_account_info(POOL_STATE, commitment=Confirmed)
+        acct = self.rpc.get_account_info(self.pool_pubkey, commitment=Confirmed)
         if not acct.value:
             raise RuntimeError("无法读取资源池账户")
         return bytes(acct.value.data)
@@ -355,10 +356,10 @@ class PDADiscovery:
 
     def discover(self) -> dict:
         log.info(f"钱包地址: {self.user}")
-        pdas = self._search_pool_txs()
+        pdas = self._search_user_txs()
         if pdas:
             return pdas
-        pdas = self._search_user_txs()
+        pdas = self._search_pool_txs()
         if pdas:
             return pdas
         log.warning("未找到 swap 交易记录")
@@ -437,15 +438,18 @@ class PDADiscovery:
             swap_writable[name] = is_writable(idx)
         pdas["_writable"] = swap_writable
 
-        # 提取 collect 指令的 writable 标记
+        # 提取 collect 指令的 PDA 和 writable 标记
         if collect_ix:
             collect_names = ["owner", "planet_state", "planet_nft",
-                            "season", "session_token"]
+                            "season", "session_token", "item_slot"]
             collect_writable = {}
             for j, idx in enumerate(collect_ix.accounts):
                 if j >= len(collect_names):
                     break
-                collect_writable[collect_names[j]] = is_writable(idx)
+                name = collect_names[j]
+                collect_writable[name] = is_writable(idx)
+                if name == "item_slot":
+                    pdas["item_slot"] = acct_keys[idx]
             pdas["_collect_writable"] = collect_writable
             log.info("找到 collect 指令 writable 标记")
 
@@ -453,6 +457,8 @@ class PDADiscovery:
         for name in swap_names:
             w = "W" if swap_writable.get(name) else "R"
             log.info(f"  {name}: {pdas[name]}  [{w}]")
+        if "item_slot" in pdas:
+            log.info(f"  item_slot: {pdas['item_slot']}")
         return normalize_pdas(pdas)
 
 
@@ -491,6 +497,12 @@ class SwapExecutor:
                         is_signer=False,
                         is_writable=w.get("session_token", w.get("user_state", False))),
         ]
+        if "item_slot" in self.pdas:
+            accounts.append(
+                AccountMeta(Pubkey.from_string(self.pdas["item_slot"]),
+                            is_signer=False,
+                            is_writable=w.get("item_slot", False)),
+            )
         return Instruction(RESOURCE_PROGRAM, COLLECT_DISCRIMINATOR, accounts)
 
     def _build_swap_ix(self, sell_type: int, buy_type: int, amount: int) -> Instruction:
@@ -509,15 +521,15 @@ class SwapExecutor:
             AccountMeta(Pubkey.from_string(self.pdas["planet_nft"]),
                         is_signer=False,
                         is_writable=w.get("planet_nft", w.get("player_component", False))),
-            AccountMeta(POOL_STATE,
+            AccountMeta(Pubkey.from_string(self.pdas["trading_pools"]),
                         is_signer=False,
                         is_writable=w.get("trading_pools", w.get("pool_state", True))),
             AccountMeta(Pubkey.from_string(self.pdas["season"]),
                         is_signer=False,
-                        is_writable=w.get("season", w.get("player_data", True))),
+                        is_writable=w.get("season", w.get("player_data", False))),
             AccountMeta(Pubkey.from_string(self.pdas["session_token"]),
                         is_signer=False,
-                        is_writable=w.get("session_token", w.get("user_state", True))),
+                        is_writable=w.get("session_token", w.get("user_state", False))),
         ]
         return Instruction(RESOURCE_PROGRAM, swap_data, accounts)
 
@@ -525,7 +537,6 @@ class SwapExecutor:
         sell_type = self.RES_MAP[sell]
         buy_type = self.RES_MAP[buy]
         return [
-            self._build_collect_ix(),
             self._build_swap_ix(sell_type, buy_type, amount),
         ]
 
@@ -659,6 +670,15 @@ class SwapExecutor:
             msg = Message.new_with_blockhash(instructions, self.keypair.pubkey(), blockhash)
             tx = Transaction.new_unsigned(msg)
             tx.sign([self.keypair], blockhash)
+
+            sim = self.rpc.simulate_transaction(tx)
+            if sim.value.err:
+                log.warning(f"  发送前模拟失败: {sim.value.err}")
+                for line in (sim.value.logs or [])[-5:]:
+                    log.warning(f"    {line}")
+                return None
+            log.info(f"  模拟通过，正在发送...")
+
             result = self.rpc.send_transaction(tx)
             sig = str(result.value)
             log.info(f"  交易已发送: {sig}")
@@ -900,7 +920,8 @@ class Bot:
             log.error("请检查 .env 中的私钥是否正确")
             sys.exit(1)
 
-        self.pool_reader = PoolReader(self.rpc)
+        pool_pubkey = Pubkey.from_string(self.pdas["trading_pools"])
+        self.pool_reader = PoolReader(self.rpc, pool_pubkey)
         self.planet_state_reader = PlanetStateReader(self.rpc, self.pdas)
         self.inventory = InventoryManager()
         self.executor = SwapExecutor(self.rpc, self.keypair, self.pdas, dry_run)
@@ -1278,7 +1299,13 @@ def cmd_discover():
 
 def cmd_rates():
     rpc = Client(RPC_URL)
-    reader = PoolReader(rpc)
+    pool_pubkey = None
+    if PDA_FILE.exists():
+        pdas = normalize_pdas(json.loads(PDA_FILE.read_text()))
+        tp = pdas.get("trading_pools", pdas.get("pool_state", ""))
+        if tp:
+            pool_pubkey = Pubkey.from_string(tp)
+    reader = PoolReader(rpc, pool_pubkey)
     rates = reader.get_rates()
     fee_mul = 1 - FEE
     print("\n当前汇率:")
